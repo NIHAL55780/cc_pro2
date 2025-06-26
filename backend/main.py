@@ -1,226 +1,191 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
-import uvicorn
-import base64
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from typing import Optional
-from google import genai
-from google.genai import types
-import os
-from tempfile import NamedTemporaryFile
-from datetime import datetime
 from dotenv import load_dotenv
+import base64
+import os
+import uvicorn
+from datetime import datetime
+from tempfile import NamedTemporaryFile
+import shutil
+import subprocess
+import platform
+import requests
+import json
+
 from middleware import setup_cors_middleware
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Initialize FastAPI app
-app = FastAPI(title="Document AI App", 
-              description="API for processing documents with AI",
-              version="0.1.0",
-              docs_url="/api-docs")
-
-# Apply CORS middleware
+# Initialize FastAPI and CORS
+app = FastAPI()
 app = setup_cors_middleware(app)
 
-# Initialize Google AI client
-api_key = os.getenv("GOOGLE_API_KEY")
-if not api_key:
-    raise ValueError("GOOGLE_API_KEY environment variable is not set.")
-    
-client = genai.Client(api_key=api_key)
+# Groq API configuration
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Get free API key from https://console.groq.com/
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Define request model
+# Models
 class CodeDocumentationRequest(BaseModel):
     code: str
-    isBase64: bool = False  # Flag to indicate if code is base64 encoded
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "code": "def hello_world():\n    print('Hello, world!')",
-                "isBase64": False
-            }
-        }
+    isBase64: bool = False
 
-# Define response model
+class GitHubURLRequest(BaseModel):
+    github_url: str
+
 class DocumentationResponse(BaseModel):
     markdown: str
 
-@app.get("/")
-async def root():
-    return {
-        "message": "Welcome to Code Documentation API",
-        "usage": {
-            "text_input": {
-                "endpoint": "/docs/gen",
-                "method": "POST",
-                "body": {
-                    "code": "Your code here (any programming language)",
-                    "isBase64": "Optional boolean (default: false) to indicate if the code is base64 encoded"
-                }
-            },
-            "file_upload": {
-                "endpoint": "/docs/from-upload",
-                "method": "POST",
-                "form": "file: Upload a text file containing code"
-            },
-            "download": {
-                "endpoint": "/docs/download",
-                "method": "POST",
-                "options": "Can accept either a request body with code OR a file upload"
-            }
-        },
-        "example": {
-            "code": "def hello_world():\n    print('Hello, world!')",
-            "isBase64": False
+# Cross-platform safe directory cleanup
+def remove_readonly(func, path, _):
+    os.chmod(path, 0o777)
+    func(path)
+
+def safe_rmtree(path):
+    if platform.system() == "Windows":
+        shutil.rmtree(path, onerror=remove_readonly)
+    else:
+        shutil.rmtree(path)
+
+# Documentation generator using Groq (free Gemma access)
+def generate_doc_with_groq(code: str) -> str:
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not found in environment variables")
+    
+    prompt = (
+        "Generate clear, comprehensive documentation for the following code:\n\n"
+        "```\n"
+        f"{code}\n"
+        "```\n\n"
+        "Please include:\n"
+        "1. Overview of what the code does\n"
+        "2. Detailed description of functions/classes with parameters and return values\n"
+        "3. Usage examples where applicable\n"
+        "4. Any important notes or considerations\n\n"
+        "Format the response in clean, professional Markdown."
+    )
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
         }
-    }
+        
+        data = {
+            "model": "gemma2-9b-it",  # Free Gemma model on Groq
+            "messages": [
+                {
+                    "role": "system", 
+                    "content": "You are a professional code documentation assistant. Generate clear, detailed documentation in Markdown format."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 2048,
+            "temperature": 0.3,
+            "top_p": 1,
+            "stream": False
+        }
+        
+        response = requests.post(GROQ_API_URL, headers=headers, json=data)
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Groq API error: {response.text}")
+        
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Documentation generation error: {str(e)}")
+
+# Routes
+@app.get("/")
+def root():
+    return {"message": "Groq Gemma Documentation API is running."}
 
 @app.post("/docs/gen", response_model=DocumentationResponse)
-async def generate_documentation(request: CodeDocumentationRequest):
+async def generate_from_code(request: CodeDocumentationRequest):
     try:
-        if not request.code:
-            raise HTTPException(status_code=400, detail="Code cannot be empty")
-        
-        # Decode base64 if the flag is set
-        try:
-            if request.isBase64:
-                code = base64.b64decode(request.code).decode('utf-8')
-            else:
-                code = request.code
-        except Exception as decode_error:
-            raise HTTPException(status_code=400, detail=f"Error decoding base64: {str(decode_error)}")
-        print(f"Decoded code:\n{code}\n")     
-        # Create a prompt for documentation generation with consistent formatting
-        prompt = (
-            "Generate concise brief documentation for the following code:\n\n"
-            "```\n"
-            f"{code}\n"
-            "```\n\n"
-            "Include only these sections:\n"
-            "1. Overview of what the code does\n"
-            "2. Description of functions with parameters and return values\n\n"
-            "Format the documentation as Markdown."
-        )
-        print(f"Generated prompt for AI:\n{prompt}\n")
-        
-        # Generation configuration
-        gen_config = types.GenerateContentConfig(
-            temperature=0.5,
-            max_output_tokens=1024
-        )
-        
-        # Generate documentation with AI
-        try:
-            response = client.models.generate_content(
-                model="gemma-3-12b-it",
-                contents=prompt,
-                config=gen_config
-            )
-            
-            return DocumentationResponse(
-                markdown=response.text
-            )
-        except Exception as api_error:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Error generating documentation: {str(api_error)}"
-            )
-    except HTTPException:
-        raise
+        code = base64.b64decode(request.code).decode() if request.isBase64 else request.code
+        markdown = generate_doc_with_groq(code)
+        return {"markdown": markdown}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-# Adding file upload endpoint for documentation generation
 @app.post("/docs/from-upload", response_model=DocumentationResponse)
-async def generate_docs_from_upload(file: UploadFile = File(...)):
+async def generate_from_upload(file: UploadFile = File(...)):
     try:
-        # Read contents of the uploaded file
-        file_content = await file.read()
-        
-        # Try to decode as text first to verify it's a valid text file
-        try:
-            # Just to verify it's readable text
-            file_content.decode('utf-8')
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="File could not be decoded as text. Please upload a text file containing code.")
-        
-        # Encode the file content as base64
-        base64_code = base64.b64encode(file_content).decode('utf-8')
-        
-        # Create a request object with base64 encoded content
-        request = CodeDocumentationRequest(code=base64_code, isBase64=True)
-        
-        # Use the existing documentation generation endpoint
-        return await generate_documentation(request)
-    except HTTPException:
-        raise
+        content = await file.read()
+        code = content.decode()
+        markdown = generate_doc_with_groq(code)
+        return {"markdown": markdown}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-
+        raise HTTPException(status_code=400, detail=f"Upload error: {str(e)}")
 
 @app.post("/docs/download")
-async def download_documentation(
+async def download_doc(
     file: Optional[UploadFile] = File(None),
     code: Optional[str] = Form(None),
     isBase64: bool = Form(False)
 ):
-    try:
-        final_request = None
-        
-        # Debug information
-        print(f"Code: {code and code[:50]}...")
-        print(f"isBase64: {isBase64}")
-        print(f"File: {file}")
-        
-        # Process uploaded file if present
-        if file and file.filename:
-            file_content = await file.read()
-            try:
-                file_content.decode('utf-8')  # Validate text file
-            except UnicodeDecodeError:
-                raise HTTPException(status_code=400, detail="Invalid text file.")
-                
-            # Create request from file
-            base64_code = base64.b64encode(file_content).decode('utf-8')
-            print(f"File content encoded to base64: {base64_code[:50]}...")
-            final_request = CodeDocumentationRequest(code=base64_code, isBase64=True)
-        
-        # Process direct code input if present
-        elif code:
-            final_request = CodeDocumentationRequest(code=code, isBase64=isBase64)
-            print(f"Using provided code input: {code[:50]}...")
-          # If neither is provided
-        else:
-            raise HTTPException(status_code=400, detail="Either 'code' or 'file' field is required")
-            
-        # Generate documentation using the same logic as /docs/gen endpoint
-        doc_response = await generate_documentation(final_request)
-        
-        # Create a timestamped filename for the download
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        doc_filename = f"code_documentation_{timestamp}.md"
-        
-        # Create a temporary file with the markdown content
-        with NamedTemporaryFile(delete=False, mode='w', suffix='.md') as temp_file:
-            temp_file.write(doc_response.markdown)
-            temp_path = temp_file.name
-        
-        # Return the file as a download
-        return FileResponse(
-            path=temp_path,
-            filename=doc_filename,
-            media_type='text/markdown',
-            background=BackgroundTask(lambda: os.unlink(temp_path))  # Delete file after download
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if file:
+        content = await file.read()
+        code_str = content.decode()
+    elif code:
+        code_str = base64.b64decode(code).decode() if isBase64 else code
+    else:
+        raise HTTPException(status_code=400, detail="No input provided")
 
-# Add this if you want to run directly using python (not needed for uvicorn command line)
+    markdown = generate_doc_with_groq(code_str)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"documentation_{timestamp}.md"
+
+    with NamedTemporaryFile(delete=False, mode='w', suffix='.md') as tmp:
+        tmp.write(markdown)
+        tmp_path = tmp.name
+
+    return FileResponse(
+        path=tmp_path,
+        filename=filename,
+        media_type="text/markdown",
+        background=BackgroundTask(lambda: os.remove(tmp_path))
+    )
+
+@app.post("/docs/from-github", response_model=DocumentationResponse)
+async def generate_from_github(req: GitHubURLRequest):
+    try:
+        github_url = req.github_url
+        if not github_url.startswith("https://github.com/"):
+            raise HTTPException(status_code=400, detail="Invalid GitHub URL.")
+
+        folder_name = f"temp_clone_{datetime.now().strftime('%H%M%S')}"
+        subprocess.run(["git", "clone", github_url, folder_name], check=True, capture_output=True)
+
+        code = ""
+        file_count = 0
+        for root, _, files in os.walk(folder_name):
+            for f in files:
+                if f.endswith((".py", ".js", ".java", ".ts", ".cpp", ".c", ".cs", ".jsx", ".tsx")) and file_count < 8:
+                    with open(os.path.join(root, f), 'r', errors="ignore") as file:
+                        file_content = file.read()
+                        if len(file_content) < 5000:  # Limit file size to avoid token limits
+                            code += f"\n\n# File: {f}\n{file_content}"
+                            file_count += 1
+
+        markdown = generate_doc_with_groq(code)
+
+        safe_rmtree(folder_name)
+        return {"markdown": markdown}
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Git clone error: {e.stderr.decode()}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GitHub processing error: {str(e)}")
+
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

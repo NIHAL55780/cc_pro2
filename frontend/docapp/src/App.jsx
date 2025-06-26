@@ -1,13 +1,19 @@
-import { useState } from 'react'
-import './App.css'
-import CodeInput from './components/CodeInput'
-import FileUpload from './components/FileUpload'
-import DocumentationDisplay from './components/DocumentationDisplay'
-import { generateDocumentation, uploadFileForDocumentation, downloadDocumentation } from './services/api'
+import { useState } from 'react';
+import './App.css';
+import CodeInput from './components/CodeInput';
+import FileUpload from './components/FileUpload';
+import DocumentationDisplay from './components/DocumentationDisplay';
+import GithubInput from './components/GithubInput';
+import {
+  generateDocumentation,
+  uploadFileForDocumentation,
+  downloadDocumentation,
+  generateFromGitHubUrl,
+} from './services/api';
 
 function App() {
   const [documentation, setDocumentation] = useState('');
-  const [activeTab, setActiveTab] = useState('code'); // 'code' or 'file'
+  const [activeTab, setActiveTab] = useState('code'); // 'code', 'file', or 'github'
   const [error, setError] = useState('');
   const [currentCode, setCurrentCode] = useState(null);
 
@@ -17,12 +23,8 @@ function App() {
       const response = await generateDocumentation(code);
       setDocumentation(response.markdown);
       setCurrentCode(code);
-      return response;
     } catch (err) {
-      const message = err.message || 'Failed to generate documentation. Please try again.';
-      setError(message);
-      console.error('Error generating documentation:', err);
-      throw err;
+      setError(err.message || 'Failed to generate documentation.');
     }
   };
 
@@ -32,12 +34,19 @@ function App() {
       const response = await uploadFileForDocumentation(file);
       setDocumentation(response.markdown);
       setCurrentCode(file);
-      return response;
     } catch (err) {
-      const message = err.message || 'Failed to process file. Please try again.';
-      setError(message);
-      console.error('Error processing file:', err);
-      throw err;
+      setError(err.message || 'Failed to process file.');
+    }
+  };
+
+  const handleGithubSubmit = async (url) => {
+    try {
+      setError('');
+      const response = await generateFromGitHubUrl(url);
+      setDocumentation(response.markdown);
+      setCurrentCode(null);
+    } catch (err) {
+      setError(err.message || 'Failed to process GitHub URL.');
     }
   };
 
@@ -45,61 +54,48 @@ function App() {
     try {
       setError('');
       await downloadDocumentation(currentCode);
-      return true;
     } catch (err) {
-      const message = err.message || 'Failed to download documentation. Please try again.';
-      setError(message);
-      console.error('Error downloading documentation:', err);
-      throw err;
+      setError(err.message || 'Download failed.');
     }
   };
 
-  // Clear error and documentation when switching tabs
   const handleTabChange = (tab) => {
-    setError('');
-    setDocumentation(''); // Clear documentation output
-    setCurrentCode(null); // Reset current code/file
     setActiveTab(tab);
+    setDocumentation('');
+    setError('');
+    setCurrentCode(null);
   };
 
   return (
     <div className="app-container">
       <header className="app-header">
         <h1>Code Documentation Generator</h1>
-        <p>Generate comprehensive documentation for your code</p>
+        <p>Generate documentation from code, file, or GitHub URL</p>
       </header>
 
       <div className="tab-navigation">
-        <button
-          className={`tab-button ${activeTab === 'code' ? 'active' : ''}`}
-          onClick={() => handleTabChange('code')}
-        >
-          Paste Code
-        </button>
-        <button
-          className={`tab-button ${activeTab === 'file' ? 'active' : ''}`}
-          onClick={() => handleTabChange('file')}
-        >
-          Upload File
-        </button>
+        {['code', 'file', 'github'].map((tab) => (
+          <button
+            key={tab}
+            className={`tab-button ${activeTab === tab ? 'active' : ''}`}
+            onClick={() => handleTabChange(tab)}
+          >
+            {tab === 'code' ? 'Paste Code' : tab === 'file' ? 'Upload File' : 'GitHub URL'}
+          </button>
+        ))}
       </div>
 
       <main className="app-content">
         <div className="input-section">
-          {activeTab === 'code' ? (
-            <CodeInput onSubmit={handleCodeSubmit} />
-          ) : (
-            <FileUpload onSubmit={handleFileSubmit} />
-          )}
+          {activeTab === 'code' && <CodeInput onSubmit={handleCodeSubmit} />}
+          {activeTab === 'file' && <FileUpload onSubmit={handleFileSubmit} />}
+          {activeTab === 'github' && <GithubInput onSubmit={handleGithubSubmit} />}
 
           {error && <div className="error-message">{error}</div>}
         </div>
 
         <div className="output-section">
-          <DocumentationDisplay
-            markdown={documentation}
-            onDownload={handleDownload}
-          />
+          <DocumentationDisplay markdown={documentation} onDownload={handleDownload} />
         </div>
       </main>
 
@@ -107,7 +103,7 @@ function App() {
         <p>Made by Team Daffodils</p>
       </footer>
     </div>
-  )
+  );
 }
 
-export default App
+export default App;

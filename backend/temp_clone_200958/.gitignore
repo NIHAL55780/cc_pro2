@@ -53,4 +53,3 @@ coverage/
 
 # Local development settings
 .DS_Store
-!codebase_documentation/
